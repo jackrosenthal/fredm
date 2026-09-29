@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -134,12 +135,11 @@ func TestLayoutMenuKeys(t *testing.T) {
 		return cmd
 	}
 
-	press(tea.KeyTab)
-	press(tea.KeyTab)
-	press(tea.KeyTab)
-	press(tea.KeyTab)
+	for range 5 {
+		press(tea.KeyTab)
+	}
 	if f := m.(model).focus; f != fieldLayout {
-		t.Fatalf("focus after 4 tabs = %d, want layout", f)
+		t.Fatalf("focus after 5 tabs = %d, want layout", f)
 	}
 	press(tea.KeyEnter)
 	if !m.(model).menuOpen {
@@ -157,6 +157,113 @@ func TestLayoutMenuKeys(t *testing.T) {
 	}
 	if got := m.(model).layouts[m.(model).layout].name(); got != "us" {
 		t.Errorf("layout = %q, want us", got)
+	}
+}
+
+// fakeSystemctl records the systemctl commands run until the test ends, and
+// fails them with err.
+func fakeSystemctl(t *testing.T, err error) *[]string {
+	t.Helper()
+	var verbs []string
+	orig := systemctl
+	systemctl = func(verb string) error {
+		verbs = append(verbs, verb)
+		return err
+	}
+	t.Cleanup(func() { systemctl = orig })
+	return &verbs
+}
+
+func TestPowerMenuPull(t *testing.T) {
+	verbs := fakeSystemctl(t, nil)
+	m := testModel(t)
+
+	bx, by := find(t, m, powerText)
+	lx, _ := find(t, m, "us (3l)")
+	if by != 1 || bx >= lx {
+		t.Errorf("power button at (%d, %d), want top right, left of the layout button", bx, by)
+	}
+	m = click(m, bx, by)
+	if !m.menuOpen || m.focus != fieldPower || m.menuHover != -1 {
+		t.Fatalf("pressing the power button: open = %v, focus = %d, hover = %d", m.menuOpen, m.focus, m.menuHover)
+	}
+
+	x, y := find(t, m, "Power off")
+	next, cmd := m.Update(tea.MouseReleaseMsg{X: x, Y: y, Button: tea.MouseLeft})
+	m = next.(model)
+	if m.menuOpen || !m.busy || m.status != "Powering off..." {
+		t.Errorf("after picking power off: open = %v, busy = %v, status = %q", m.menuOpen, m.busy, m.status)
+	}
+	if cmd == nil {
+		t.Fatal("picking power off returned no command")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(model)
+	if len(*verbs) != 1 || (*verbs)[0] != "poweroff" {
+		t.Errorf("systemctl ran %q, want poweroff", *verbs)
+	}
+	if !m.busy {
+		t.Error("form not busy after powering off")
+	}
+}
+
+func TestMenuDragAcross(t *testing.T) {
+	m := testModel(t)
+
+	px, py := find(t, m, powerText)
+	lx, ly := find(t, m, "us (3l)")
+	m = click(m, px, py)
+	next, _ := m.Update(tea.MouseMotionMsg{X: lx, Y: ly, Button: tea.MouseLeft})
+	m = next.(model)
+	if !m.menuOpen || !m.menuPulled || m.focus != fieldLayout {
+		t.Fatalf("dragging onto the layout button: open = %v, pulled = %v, focus = %d", m.menuOpen, m.menuPulled, m.focus)
+	}
+
+	x, y := find(t, m, " us  ")
+	next, cmd := m.Update(tea.MouseReleaseMsg{X: x, Y: y, Button: tea.MouseLeft})
+	m = next.(model)
+	if got := m.layouts[m.layout].name(); m.menuOpen || got != "us" || !sendsRaw(cmd, "\033]keymap:layout=us;variant=\a") {
+		t.Errorf("releasing on us after dragging across: open = %v, layout = %q", m.menuOpen, got)
+	}
+
+	// And back, from the layout pull-down to the power one.
+	m = click(m, lx, ly)
+	next, _ = m.Update(tea.MouseMotionMsg{X: px, Y: py, Button: tea.MouseLeft})
+	m = next.(model)
+	if !m.menuOpen || !m.menuPulled || m.focus != fieldPower {
+		t.Errorf("dragging onto the power button: open = %v, pulled = %v, focus = %d", m.menuOpen, m.menuPulled, m.focus)
+	}
+}
+
+func TestPowerMenuKeysFail(t *testing.T) {
+	verbs := fakeSystemctl(t, errors.New("access denied"))
+	var m tea.Model = testModel(t)
+	var cmd tea.Cmd
+	press := func(code rune) {
+		m, cmd = m.Update(tea.KeyPressMsg{Code: code})
+	}
+
+	press(tea.KeyUp)
+	press(tea.KeyUp)
+	if f := m.(model).focus; f != fieldPower {
+		t.Fatalf("focus after 2 ups = %d, want power", f)
+	}
+	press(tea.KeyEnter)
+	press(tea.KeyEnter)
+	if cmd != nil || !m.(model).menuOpen {
+		t.Fatal("enter with nothing highlighted closed the menu or did something")
+	}
+	press(tea.KeyDown)
+	press(tea.KeyEnter)
+	if cmd == nil {
+		t.Fatal("picking restart returned no command")
+	}
+	m, _ = m.Update(cmd())
+	if len(*verbs) != 1 || (*verbs)[0] != "reboot" {
+		t.Errorf("systemctl ran %q, want reboot", *verbs)
+	}
+	if got := m.(model); got.busy || !got.statusErr || got.status != "access denied" {
+		t.Errorf("after a failed restart: busy = %v, status = %q, error = %v", got.busy, got.status, got.statusErr)
 	}
 }
 

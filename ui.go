@@ -36,10 +36,16 @@ const (
 	fieldPass
 	fieldSession
 	fieldButton
-	// fieldLayout is the layout dropdown at the top right of the screen.
+	// fieldPower and fieldLayout are the power and layout pull-downs at the
+	// top right of the screen.
+	fieldPower
 	fieldLayout
 	numFields
 )
+
+func isMenu(f field) bool {
+	return f == fieldPower || f == fieldLayout
+}
 
 var fieldRows = [...]int{
 	fieldUser:    rowUser,
@@ -101,10 +107,10 @@ type model struct {
 	layout  int
 	focus   field
 
-	// menuOpen is whether the layout dropdown is open, and menuHover the
-	// highlighted layout in it, or -1. menuPulled is whether it was opened
-	// by pressing the mouse on its button, so releasing the mouse picks the
-	// layout under the pointer.
+	// menuOpen is whether the focused pull-down is open, and menuHover the
+	// highlighted item in it, or -1. menuPulled is whether it was opened by
+	// pressing the mouse on its button, so releasing the mouse picks the
+	// item under the pointer.
 	menuOpen   bool
 	menuHover  int
 	menuPulled bool
@@ -171,6 +177,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.result = &loginResult{tx: msg.tx, session: m.sessions[m.session], layout: m.layouts[m.layout]}
 		return m, tea.Quit
+
+	case powerMsg:
+		if msg.err != nil {
+			m.busy = false
+			m.setStatus(msg.err.Error(), true)
+		}
+		return m, nil
 	}
 
 	if m.busy {
@@ -187,6 +200,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.MouseMotionMsg:
 		if m.menuPulled {
+			// Dragging onto the other button pulls its menu down instead.
+			for _, f := range []field{fieldPower, fieldLayout} {
+				if f != m.focus && padded(m.menuButton(f)).contains(msg.X, msg.Y) {
+					cmd := m.setFocus(f)
+					m.openMenu()
+					return m, cmd
+				}
+			}
 			m.menuHover = -1
 			if i, ok := m.menuItemAt(msg.X, msg.Y); ok {
 				m.menuHover = i
@@ -196,7 +217,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseReleaseMsg:
 		if m.menuPulled {
 			if i, ok := m.menuItemAt(msg.X, msg.Y); ok {
-				return m, m.selectLayout(i)
+				return m, m.pick(i)
 			}
 			m.menuOpen, m.menuPulled = false, false
 		}
@@ -220,7 +241,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.menuOpen {
 		return m.handleMenuKey(msg)
 	}
-	if m.focus == fieldLayout {
+	if isMenu(m.focus) {
 		switch msg.String() {
 		case "enter", "space":
 			m.openMenu()
@@ -255,7 +276,7 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleMenuKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	n := len(m.layouts)
+	n := len(m.menuItems(m.focus))
 	switch msg.String() {
 	case "up", "shift+tab":
 		m.menuHover = (max(m.menuHover, 0) + n - 1) % n
@@ -263,7 +284,7 @@ func (m model) handleMenuKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.menuHover = (m.menuHover + 1) % n
 	case "enter", "space":
 		if m.menuHover >= 0 {
-			return m, m.selectLayout(m.menuHover)
+			return m, m.pick(m.menuHover)
 		}
 	case "esc":
 		m.menuOpen, m.menuPulled = false, false
@@ -273,20 +294,22 @@ func (m model) handleMenuKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 
 func (m model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 	if m.menuOpen {
-		// While the dropdown is open from the keyboard, a click picks a
-		// layout or closes it.
+		// While a pull-down is open from the keyboard, a click picks an
+		// item or closes it.
 		if i, ok := m.menuItemAt(x, y); ok {
-			return m, m.selectLayout(i)
+			return m, m.pick(i)
 		}
 		m.menuOpen = false
 		return m, nil
 	}
-	if padded(m.menuButton()).contains(x, y) {
-		// Pressing the button pulls the dropdown down until the release.
-		cmd := m.setFocus(fieldLayout)
-		m.openMenu()
-		m.menuPulled = true
-		return m, cmd
+	for _, f := range []field{fieldPower, fieldLayout} {
+		if padded(m.menuButton(f)).contains(x, y) {
+			// Pressing the button pulls the menu down until the release.
+			cmd := m.setFocus(f)
+			m.openMenu()
+			m.menuPulled = true
+			return m, cmd
+		}
 	}
 
 	f, ok := m.fieldAt(x, y)
@@ -339,14 +362,23 @@ func (m *model) cycleSession(delta int) {
 	m.session = (m.session + delta + n) % n
 }
 
+// openMenu opens the focused pull-down. The layout pull-down highlights the
+// current layout, and the power pull-down nothing.
 func (m *model) openMenu() {
 	m.menuOpen = true
-	m.menuHover = m.layout
+	m.menuHover = -1
+	if m.focus == fieldLayout {
+		m.menuHover = m.layout
+	}
 }
 
-// selectLayout closes the dropdown and switches to layout i.
-func (m *model) selectLayout(i int) tea.Cmd {
+// pick closes the open pull-down and does item i: switches to a layout or
+// starts a power action.
+func (m *model) pick(i int) tea.Cmd {
 	m.menuOpen, m.menuPulled = false, false
+	if m.focus == fieldPower {
+		return m.power(powerActions[i])
+	}
 	m.layout = i
 	return m.setKeymap()
 }
@@ -367,7 +399,7 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 		return m, m.setFocus(fieldUser)
 	}
 	m.busy = true
-	m.setStatus("Authenticating…", false)
+	m.setStatus("Authenticating...", false)
 	service, password := m.pamService, m.pass.Value()
 	return m, func() tea.Msg {
 		tx, err := authenticate(service, user, password)
@@ -409,51 +441,75 @@ func (m model) fieldAt(x, y int) (field, bool) {
 	return 0, false
 }
 
-// menuButton returns the text row of the layout dropdown's button, at the
-// top right of the screen. It is as wide as the longest layout name, so it
-// does not move when the layout changes.
-func (m model) menuButton() cellRect {
-	w := 0
+// menuItems returns the names of the items in a pull-down.
+func (m model) menuItems(f field) []string {
+	var items []string
+	if f == fieldPower {
+		for _, a := range powerActions {
+			items = append(items, a.name)
+		}
+		return items
+	}
 	for _, l := range m.layouts {
-		w = max(w, ansi.StringWidth(l.name()))
+		items = append(items, l.name())
+	}
+	return items
+}
+
+// menuButton returns the text row of a pull-down's button. The layout
+// button is at the top right of the screen, and the power button left of
+// it. A button is as wide as its longest item, so the layout button does
+// not move when the layout changes.
+func (m model) menuButton(f field) cellRect {
+	w := 0
+	for _, s := range m.menuItems(f) {
+		w = max(w, ansi.StringWidth(s))
 	}
 	w += 2
-	return cellRect{max(0, m.width-w-2), 1, w, 1}
+	x := m.width - w - 2
+	if f == fieldPower {
+		x = m.menuButton(fieldLayout).x - w - 1
+	}
+	return cellRect{max(0, x), 1, w, 1}
 }
 
-// menu returns the open dropdown, right under the button, with a row of
-// padding above and below the layouts. The half row of the button's padding
+// menu returns the open pull-down, right under its button, with a row of
+// padding above and below the items. The half row of the button's padding
 // covers the top half of the row above.
 func (m model) menu() cellRect {
-	b := m.menuButton()
-	return cellRect{b.x, b.y + 1, b.w, len(m.layouts) + 2}
+	b := m.menuButton(m.focus)
+	return cellRect{b.x, b.y + 1, b.w, len(m.menuItems(m.focus)) + 2}
 }
 
-// menuItemAt returns the layout under a screen position in the open
-// dropdown.
+// menuItemAt returns the item under a screen position in the open
+// pull-down.
 func (m model) menuItemAt(x, y int) (int, bool) {
 	r := m.menu()
 	i := y - r.y - 1
-	return i, r.contains(x, y) && i >= 0 && i < len(m.layouts)
+	return i, r.contains(x, y) && i >= 0 && i < len(m.menuItems(m.focus))
 }
 
-func (m model) renderMenuButton() string {
+func (m model) renderMenuButton(f field) string {
 	style := menuButtonStyle
-	if m.focus == fieldLayout && !m.busy {
+	if m.focus == f && !m.busy {
 		style = focusedMenuButton
 	}
-	return style.Width(m.menuButton().w).Render(" " + m.layouts[m.layout].name())
+	text := powerText
+	if f == fieldLayout {
+		text = m.layouts[m.layout].name()
+	}
+	return style.Width(m.menuButton(f).w).Render(" " + text)
 }
 
 func (m model) renderMenu() string {
 	r := m.menu()
 	rows := []string{menuItemStyle.Render(strings.Repeat(" ", r.w))}
-	for i, l := range m.layouts {
+	for i, s := range m.menuItems(m.focus) {
 		style := menuItemStyle
 		if i == m.menuHover {
 			style = hoveredMenuItem
 		}
-		rows = append(rows, style.Width(r.w).Render(" "+l.name()))
+		rows = append(rows, style.Width(r.w).Render(" "+s))
 	}
 	rows = append(rows, rows[0])
 	return strings.Join(rows, "\n")
@@ -473,7 +529,7 @@ func (m model) renderSession(r cellRect) string {
 	}
 	name := lipgloss.NewStyle().Bold(focused).
 		Width(r.w - 4).Align(lipgloss.Center).
-		Render(ansi.Truncate(m.sessions[m.session].name, r.w-4, "…"))
+		Render(ansi.Truncate(m.sessions[m.session].name, r.w-4, "..."))
 	return " " + arrows.Render("‹") + name + arrows.Render("›") + " "
 }
 
@@ -504,7 +560,8 @@ func (m model) boxes() string {
 		button = colorPink
 	}
 	boxes = append(boxes, padBoxes(m.widget(fieldButton), button, m.cellW, m.cellH)...)
-	boxes = append(boxes, padBoxes(m.menuButton(), colorBlack, m.cellW, m.cellH)...)
+	boxes = append(boxes, padBoxes(m.menuButton(fieldPower), colorBlack, m.cellW, m.cellH)...)
+	boxes = append(boxes, padBoxes(m.menuButton(fieldLayout), colorBlack, m.cellW, m.cellH)...)
 	return boxEscapes(boxes)
 }
 
@@ -533,7 +590,7 @@ func (m model) View() tea.View {
 	layers := []*lipgloss.Layer{
 		at(c, onCard.Width(c.w).Height(c.h).Render("")),
 		lipgloss.NewLayer(titleStyle.Width(formWidth).Align(lipgloss.Center).
-			Render(ansi.Truncate(m.hostname, formWidth, "…"))).X(formX).Y(c.y + rowTitle),
+			Render(ansi.Truncate(m.hostname, formWidth, "..."))).X(formX).Y(c.y + rowTitle),
 		label(fieldUser, "User"),
 		at(user, renderInput(user, m.user)),
 		label(fieldPass, "Password"),
@@ -541,8 +598,9 @@ func (m model) View() tea.View {
 		label(fieldSession, "Session"),
 		at(session, m.renderSession(session)),
 		at(button, m.renderButton(button)),
-		lipgloss.NewLayer(status.Render(ansi.Truncate(m.status, formWidth, "…"))).X(formX).Y(c.y + rowStatus),
-		at(m.menuButton(), m.renderMenuButton()),
+		lipgloss.NewLayer(status.Render(ansi.Truncate(m.status, formWidth, "..."))).X(formX).Y(c.y + rowStatus),
+		at(m.menuButton(fieldPower), m.renderMenuButton(fieldPower)),
+		at(m.menuButton(fieldLayout), m.renderMenuButton(fieldLayout)),
 	}
 	if m.menuOpen {
 		layers = append(layers, at(m.menu(), m.renderMenu()).Z(1))
