@@ -71,7 +71,7 @@ func TestClickCyclesSession(t *testing.T) {
 func TestLayoutMenuPull(t *testing.T) {
 	m := testModel(t)
 
-	bx, by := find(t, m, "us (3l) ▾")
+	bx, by := find(t, m, "us (3l)")
 	if by != 1 || bx < 80 {
 		t.Errorf("layout button at (%d, %d), want top right", bx, by)
 	}
@@ -104,7 +104,7 @@ func TestLayoutMenuPull(t *testing.T) {
 func TestLayoutMenuReleaseOutside(t *testing.T) {
 	m := testModel(t)
 
-	x, y := find(t, m, "us (3l) ▾")
+	x, y := find(t, m, "us (3l)")
 	m = click(m, x, y)
 	next, _ := m.Update(tea.MouseMotionMsg{X: 0, Y: 10, Button: tea.MouseLeft})
 	m = next.(model)

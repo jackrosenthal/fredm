@@ -417,7 +417,7 @@ func (m model) menuButton() cellRect {
 	for _, l := range m.layouts {
 		w = max(w, ansi.StringWidth(l.name()))
 	}
-	w += 4
+	w += 2
 	return cellRect{max(0, m.width-w-2), 1, w, 1}
 }
 
@@ -442,21 +442,18 @@ func (m model) renderMenuButton() string {
 	if m.focus == fieldLayout && !m.busy {
 		style = focusedMenuButton
 	}
-	w := m.menuButton().w
-	name := m.layouts[m.layout].name()
-	return style.Render(" " + name + strings.Repeat(" ", w-3-ansi.StringWidth(name)) + "▾ ")
+	return style.Width(m.menuButton().w).Render(" " + m.layouts[m.layout].name())
 }
 
 func (m model) renderMenu() string {
 	r := m.menu()
-	pad := menuItemStyle.Render(" ")
 	rows := []string{menuItemStyle.Render(strings.Repeat(" ", r.w))}
 	for i, l := range m.layouts {
 		style := menuItemStyle
 		if i == m.menuHover {
 			style = hoveredMenuItem
 		}
-		rows = append(rows, pad+style.Width(r.w-2).Render(" "+l.name())+pad)
+		rows = append(rows, style.Width(r.w).Render(" "+l.name()))
 	}
 	rows = append(rows, rows[0])
 	return strings.Join(rows, "\n")
