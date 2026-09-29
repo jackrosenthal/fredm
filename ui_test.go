@@ -11,7 +11,8 @@ import (
 func testModel(t *testing.T) model {
 	t.Helper()
 	sessions := []sessionEntry{{id: "sway", name: "Sway", exec: []string{"sway"}}, shellSession}
-	var m tea.Model = newModel("login", "testhost", sessions)
+	layouts := []keyLayout{{layout: "us", variant: "3l"}, {layout: "us"}}
+	var m tea.Model = newModel("login", "testhost", sessions, layouts)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return m.(model)
 }
@@ -63,6 +64,124 @@ func TestClickCyclesSession(t *testing.T) {
 	if got := m.sessions[m.session].name; got != "Sway" {
 		t.Errorf("session after clicking ‹ = %q, want Sway", got)
 	}
+}
+
+func TestLayoutMenuPull(t *testing.T) {
+	m := testModel(t)
+
+	bx, by := find(t, m, "us (3l) ▾")
+	if by != 0 || bx < 80 {
+		t.Errorf("layout button at (%d, %d), want top right", bx, by)
+	}
+	m = click(m, bx, by)
+	if !m.menuOpen || m.focus != fieldLayout {
+		t.Fatalf("pressing the layout button: open = %v, focus = %d", m.menuOpen, m.focus)
+	}
+
+	// "│ us  " matches the "us" item, not "us (3l)".
+	x, y := find(t, m, "│ us  ")
+	x += 2
+	next, _ := m.Update(tea.MouseMotionMsg{X: x, Y: y, Button: tea.MouseLeft})
+	m = next.(model)
+	if m.menuHover != 1 {
+		t.Errorf("hover after dragging to us = %d, want 1", m.menuHover)
+	}
+
+	next, cmd := m.Update(tea.MouseReleaseMsg{X: x, Y: y, Button: tea.MouseLeft})
+	m = next.(model)
+	if m.menuOpen {
+		t.Error("menu still open after releasing on a layout")
+	}
+	if got := m.layouts[m.layout].name(); got != "us" {
+		t.Errorf("layout = %q, want us", got)
+	}
+	if !sendsRaw(cmd, "\033]keymap:layout=us;variant=\a") {
+		t.Error("releasing on a layout did not send the keymap escape")
+	}
+}
+
+func TestLayoutMenuReleaseOutside(t *testing.T) {
+	m := testModel(t)
+
+	x, y := find(t, m, "us (3l) ▾")
+	m = click(m, x, y)
+	next, _ := m.Update(tea.MouseMotionMsg{X: 0, Y: 10, Button: tea.MouseLeft})
+	m = next.(model)
+	if m.menuHover != -1 {
+		t.Errorf("hover off the menu = %d, want -1", m.menuHover)
+	}
+	next, cmd := m.Update(tea.MouseReleaseMsg{X: 0, Y: 10, Button: tea.MouseLeft})
+	m = next.(model)
+	if m.menuOpen || m.layout != 0 || cmd != nil {
+		t.Errorf("release off the menu: open = %v, layout = %d", m.menuOpen, m.layout)
+	}
+
+	// A click on the button without a drag opens and closes it.
+	m = click(m, x, y)
+	next, _ = m.Update(tea.MouseReleaseMsg{X: x, Y: y, Button: tea.MouseLeft})
+	m = next.(model)
+	if m.menuOpen || m.layout != 0 {
+		t.Errorf("click on the button: open = %v, layout = %d", m.menuOpen, m.layout)
+	}
+}
+
+func TestLayoutMenuKeys(t *testing.T) {
+	var m tea.Model = testModel(t)
+	press := func(code rune) tea.Cmd {
+		var cmd tea.Cmd
+		m, cmd = m.Update(tea.KeyPressMsg{Code: code})
+		return cmd
+	}
+
+	press(tea.KeyTab)
+	press(tea.KeyTab)
+	press(tea.KeyTab)
+	press(tea.KeyTab)
+	if f := m.(model).focus; f != fieldLayout {
+		t.Fatalf("focus after 4 tabs = %d, want layout", f)
+	}
+	press(tea.KeyEnter)
+	if !m.(model).menuOpen {
+		t.Fatal("enter did not open the menu")
+	}
+	press(tea.KeyEscape)
+	if m.(model).menuOpen || m.(model).layout != 0 {
+		t.Error("escape did not close the menu unchanged")
+	}
+
+	press(tea.KeyEnter)
+	press(tea.KeyDown)
+	if !sendsRaw(press(tea.KeyEnter), "\033]keymap:layout=us;variant=\a") {
+		t.Error("picking a layout did not send the keymap escape")
+	}
+	if got := m.(model).layouts[m.(model).layout].name(); got != "us" {
+		t.Errorf("layout = %q, want us", got)
+	}
+}
+
+func TestInitSetsKeymap(t *testing.T) {
+	m := testModel(t)
+	if !sendsRaw(m.Init(), "\033]keymap:layout=us;variant=3l\a") {
+		t.Error("Init did not send the default keymap escape")
+	}
+}
+
+// sendsRaw reports whether cmd, or a command it batches, writes s.
+func sendsRaw(cmd tea.Cmd, s string) bool {
+	if cmd == nil {
+		return false
+	}
+	switch msg := cmd().(type) {
+	case tea.RawMsg:
+		return msg.Msg == s
+	case tea.BatchMsg:
+		for _, c := range msg {
+			if sendsRaw(c, s) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestClickButtonNeedsUser(t *testing.T) {

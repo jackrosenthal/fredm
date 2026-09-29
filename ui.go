@@ -32,6 +32,8 @@ const (
 	fieldPass
 	fieldSession
 	fieldButton
+	// fieldLayout is the layout dropdown at the top right of the screen.
+	fieldLayout
 	numFields
 )
 
@@ -47,13 +49,16 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(colorBorder).
 			Padding(boxPadVert, boxPadHorz)
-	titleStyle         = lipgloss.NewStyle().Bold(true).Foreground(colorTitle)
-	labelStyle         = lipgloss.NewStyle().Width(labelWidth)
-	focusedLabelStyle  = labelStyle.Bold(true).Foreground(colorAccent)
-	buttonStyle        = lipgloss.NewStyle().Padding(0, 2).Border(lipgloss.RoundedBorder(), false, true).BorderForeground(colorBorder)
-	focusedButtonStyle = buttonStyle.Bold(true).Reverse(true).Foreground(colorAccent).BorderForeground(colorAccent)
-	errorStyle         = lipgloss.NewStyle().Foreground(colorError)
-	dimStyle           = lipgloss.NewStyle().Foreground(colorDim)
+	titleStyle             = lipgloss.NewStyle().Bold(true).Foreground(colorTitle)
+	labelStyle             = lipgloss.NewStyle().Width(labelWidth)
+	focusedLabelStyle      = labelStyle.Bold(true).Foreground(colorAccent)
+	buttonStyle            = lipgloss.NewStyle().Padding(0, 2).Border(lipgloss.RoundedBorder(), false, true).BorderForeground(colorBorder)
+	focusedButtonStyle     = buttonStyle.Bold(true).Reverse(true).Foreground(colorAccent).BorderForeground(colorAccent)
+	menuButtonStyle        = lipgloss.NewStyle().Padding(0, 1).Foreground(colorDim)
+	focusedMenuButtonStyle = menuButtonStyle.Bold(true).Reverse(true).Foreground(colorAccent)
+	menuStyle              = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder)
+	errorStyle             = lipgloss.NewStyle().Foreground(colorError)
+	dimStyle               = lipgloss.NewStyle().Foreground(colorDim)
 )
 
 const buttonText = "Log in"
@@ -62,6 +67,7 @@ const buttonText = "Log in"
 type loginResult struct {
 	tx      *pam.Transaction
 	session sessionEntry
+	layout  keyLayout
 }
 
 type authMsg struct {
@@ -73,11 +79,21 @@ type model struct {
 	pamService string
 	hostname   string
 	sessions   []sessionEntry
+	layouts    []keyLayout
 
 	user    textinput.Model
 	pass    textinput.Model
 	session int
+	layout  int
 	focus   field
+
+	// menuOpen is whether the layout dropdown is open, and menuHover the
+	// highlighted layout in it, or -1. menuPulled is whether it was opened
+	// by pressing the mouse on its button, so releasing the mouse picks the
+	// layout under the pointer.
+	menuOpen   bool
+	menuHover  int
+	menuPulled bool
 
 	width, height int
 	busy          bool
@@ -85,7 +101,7 @@ type model struct {
 	result        *loginResult
 }
 
-func newModel(pamService, hostname string, sessions []sessionEntry) model {
+func newModel(pamService, hostname string, sessions []sessionEntry, layouts []keyLayout) model {
 	newInput := func() textinput.Model {
 		ti := textinput.New()
 		ti.Prompt = ""
@@ -97,6 +113,7 @@ func newModel(pamService, hostname string, sessions []sessionEntry) model {
 		pamService: pamService,
 		hostname:   hostname,
 		sessions:   sessions,
+		layouts:    layouts,
 		user:       newInput(),
 		pass:       newInput(),
 	}
@@ -107,7 +124,8 @@ func newModel(pamService, hostname string, sessions []sessionEntry) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return textinput.Blink
+	// frecon keeps the keymap from the last run, so reset it to the default.
+	return tea.Batch(textinput.Blink, m.setKeymap())
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -123,7 +141,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pass.Reset()
 			return m, m.setFocus(fieldPass)
 		}
-		m.result = &loginResult{tx: msg.tx, session: m.sessions[m.session]}
+		m.result = &loginResult{tx: msg.tx, session: m.sessions[m.session], layout: m.layouts[m.layout]}
 		return m, tea.Quit
 	}
 
@@ -137,6 +155,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseClickMsg:
 		if msg.Button == tea.MouseLeft {
 			return m.handleClick(msg.X, msg.Y)
+		}
+		return m, nil
+	case tea.MouseMotionMsg:
+		if m.menuPulled {
+			m.menuHover = -1
+			if i, ok := m.menuItemAt(msg.X, msg.Y); ok {
+				m.menuHover = i
+			}
+		}
+		return m, nil
+	case tea.MouseReleaseMsg:
+		if m.menuPulled {
+			if i, ok := m.menuItemAt(msg.X, msg.Y); ok {
+				return m, m.selectLayout(i)
+			}
+			m.menuOpen, m.menuPulled = false, false
 		}
 		return m, nil
 	case tea.MouseWheelMsg:
@@ -155,6 +189,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.menuOpen {
+		return m.handleMenuKey(msg)
+	}
+	if m.focus == fieldLayout {
+		switch msg.String() {
+		case "enter", "space":
+			m.openMenu()
+			return m, nil
+		}
+	}
 	switch msg.String() {
 	case "tab", "down":
 		return m, m.setFocus((m.focus + 1) % numFields)
@@ -182,7 +226,41 @@ func (m model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m.updateInput(msg)
 }
 
+func (m model) handleMenuKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	n := len(m.layouts)
+	switch msg.String() {
+	case "up", "shift+tab":
+		m.menuHover = (max(m.menuHover, 0) + n - 1) % n
+	case "down", "tab":
+		m.menuHover = (m.menuHover + 1) % n
+	case "enter", "space":
+		if m.menuHover >= 0 {
+			return m, m.selectLayout(m.menuHover)
+		}
+	case "esc":
+		m.menuOpen, m.menuPulled = false, false
+	}
+	return m, nil
+}
+
 func (m model) handleClick(x, y int) (tea.Model, tea.Cmd) {
+	if m.menuOpen {
+		// While the dropdown is open from the keyboard, a click picks a
+		// layout or closes it.
+		if i, ok := m.menuItemAt(x, y); ok {
+			return m, m.selectLayout(i)
+		}
+		m.menuOpen = false
+		return m, nil
+	}
+	if bx, by, bw := m.menuButtonPos(); y == by && x >= bx && x < bx+bw {
+		// Pressing the button pulls the dropdown down until the release.
+		cmd := m.setFocus(fieldLayout)
+		m.openMenu()
+		m.menuPulled = true
+		return m, cmd
+	}
+
 	col, row, ok := m.formPos(x, y)
 	if !ok {
 		return m, nil
@@ -239,6 +317,23 @@ func (m *model) setFocus(f field) tea.Cmd {
 func (m *model) cycleSession(delta int) {
 	n := len(m.sessions)
 	m.session = (m.session + delta + n) % n
+}
+
+func (m *model) openMenu() {
+	m.menuOpen = true
+	m.menuHover = m.layout
+}
+
+// selectLayout closes the dropdown and switches to layout i.
+func (m *model) selectLayout(i int) tea.Cmd {
+	m.menuOpen, m.menuPulled = false, false
+	m.layout = i
+	return m.setKeymap()
+}
+
+// setKeymap switches frecon to the selected layout.
+func (m model) setKeymap() tea.Cmd {
+	return tea.Raw(m.layouts[m.layout].escape())
 }
 
 func (m model) submit() (tea.Model, tea.Cmd) {
@@ -321,22 +416,82 @@ func (m model) renderBox() string {
 	return boxStyle.Render(strings.Join(rows, "\n"))
 }
 
+// menuButtonText is the layout dropdown's button, which shows the layout.
+func (m model) menuButtonText() string {
+	return m.layouts[m.layout].name() + " ▾"
+}
+
+// menuButtonPos returns the screen position and width of the layout
+// dropdown's button, at the top right of the screen.
+func (m model) menuButtonPos() (x, y, w int) {
+	w = lipgloss.Width(menuButtonStyle.Render(m.menuButtonText()))
+	return max(0, m.width-w-1), 0, w
+}
+
+func (m model) renderMenuButton() string {
+	style := menuButtonStyle
+	if m.focus == fieldLayout && !m.busy {
+		style = focusedMenuButtonStyle
+	}
+	return style.Render(m.menuButtonText())
+}
+
+// menuWidth is the width of the items in the open dropdown.
+func (m model) menuWidth() int {
+	w := 0
+	for _, l := range m.layouts {
+		w = max(w, lipgloss.Width(l.name()))
+	}
+	return w + 2
+}
+
+// menuPos returns the screen position of the open dropdown, under the
+// button and aligned to its right edge.
+func (m model) menuPos() (int, int) {
+	bx, by, bw := m.menuButtonPos()
+	return max(0, bx+bw-m.menuWidth()-2*boxBorder), by + 1
+}
+
+// menuItemAt returns the layout under a screen position in the open
+// dropdown.
+func (m model) menuItemAt(x, y int) (int, bool) {
+	mx, my := m.menuPos()
+	col, i := x-mx-boxBorder, y-my-boxBorder
+	ok := col >= 0 && col < m.menuWidth() && i >= 0 && i < len(m.layouts)
+	return i, ok
+}
+
+func (m model) renderMenu() string {
+	item := lipgloss.NewStyle().Width(m.menuWidth()).Padding(0, 1)
+	items := make([]string, len(m.layouts))
+	for i, l := range m.layouts {
+		style := item
+		if i == m.menuHover {
+			style = item.Bold(true).Reverse(true).Foreground(colorAccent)
+		}
+		items[i] = style.Render(l.name())
+	}
+	return menuStyle.Render(strings.Join(items, "\n"))
+}
+
 func (m model) View() tea.View {
 	box := m.renderBox()
-	bx, by := m.boxOrigin(lipgloss.Width(box), lipgloss.Height(box))
-	indent := strings.Repeat(" ", bx)
+	boxW, boxH := lipgloss.Width(box), lipgloss.Height(box)
+	bx, by := m.boxOrigin(boxW, boxH)
+	mbx, mby, _ := m.menuButtonPos()
 
-	var b strings.Builder
-	b.WriteString(strings.Repeat("\n", by))
-	for i, line := range strings.Split(box, "\n") {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(indent)
-		b.WriteString(line)
+	layers := []*lipgloss.Layer{
+		lipgloss.NewLayer(box).X(bx).Y(by),
+		lipgloss.NewLayer(m.renderMenuButton()).X(mbx).Y(mby),
 	}
+	if m.menuOpen {
+		mx, my := m.menuPos()
+		layers = append(layers, lipgloss.NewLayer(m.renderMenu()).X(mx).Y(my).Z(1))
+	}
+	canvas := lipgloss.NewCanvas(max(m.width, boxW), max(m.height, boxH))
+	canvas.Compose(lipgloss.NewCompositor(layers...))
 
-	v := tea.NewView(b.String())
+	v := tea.NewView(canvas.Render())
 	v.AltScreen = true
 	v.MouseMode = tea.MouseModeCellMotion
 	return v

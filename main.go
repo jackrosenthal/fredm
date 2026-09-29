@@ -17,8 +17,9 @@ import (
 )
 
 type cli struct {
-	PAMService  string `name:"pam-service" default:"login" help:"PAM service to authenticate with."`
-	SessionsDir string `name:"sessions-dir" default:"/usr/share/wayland-sessions" help:"Directory of session desktop entries."`
+	PAMService  string   `name:"pam-service" default:"login" help:"PAM service to authenticate with."`
+	SessionsDir string   `name:"sessions-dir" default:"/usr/share/wayland-sessions" help:"Directory of session desktop entries."`
+	Layouts     []string `name:"layouts" default:"us:3l,us" help:"Keyboard layouts to choose from, as layout or layout:variant. The first is the default."`
 }
 
 func main() {
@@ -51,7 +52,19 @@ func run(args cli) error {
 		hostname = "fredm"
 	}
 
-	m := newModel(args.PAMService, hostname, loadSessions(args.SessionsDir))
+	var layouts []keyLayout
+	for _, s := range args.Layouts {
+		l, err := parseLayout(s)
+		if err != nil {
+			return err
+		}
+		layouts = append(layouts, l)
+	}
+	if len(layouts) == 0 {
+		return fmt.Errorf("no keyboard layouts")
+	}
+
+	m := newModel(args.PAMService, hostname, loadSessions(args.SessionsDir), layouts)
 	final, err := tea.NewProgram(m).Run()
 	if err != nil {
 		return fmt.Errorf("running form: %w", err)
@@ -61,5 +74,5 @@ func run(args cli) error {
 	if res == nil {
 		return nil
 	}
-	return runSession(res.tx, res.session)
+	return runSession(res.tx, res.session, res.layout)
 }

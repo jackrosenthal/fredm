@@ -20,7 +20,7 @@ const defaultPath = "/usr/local/sbin:/usr/local/bin:/usr/bin"
 
 // runSession opens a PAM session for an authenticated transaction, runs the
 // chosen session as the user, waits for it to exit, and closes the session.
-func runSession(tx *pam.Transaction, sess sessionEntry) error {
+func runSession(tx *pam.Transaction, sess sessionEntry, layout keyLayout) error {
 	defer func() { _ = tx.End() }()
 
 	name, err := tx.GetItem(pam.User)
@@ -39,6 +39,7 @@ func runSession(tx *pam.Transaction, sess sessionEntry) error {
 		returnVT int
 		sessEnv  = map[string]string{"XDG_SESSION_CLASS": "user"}
 	)
+	layout.setEnv(sessEnv)
 	if sess.shell {
 		ttyPath, err := os.Readlink("/proc/self/fd/0")
 		if err != nil {
