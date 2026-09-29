@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -12,7 +14,7 @@ func testModel(t *testing.T) model {
 	t.Helper()
 	sessions := []sessionEntry{{id: "sway", name: "Sway", exec: []string{"sway"}}, shellSession}
 	layouts := []keyLayout{{layout: "us", variant: "3l"}, {layout: "us"}}
-	var m tea.Model = newModel("login", "testhost", sessions, layouts)
+	var m tea.Model = newModel("login", "testhost", sessions, layouts, nil)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return m.(model)
 }
@@ -53,10 +55,10 @@ func TestClickFocusesFields(t *testing.T) {
 func TestClickCyclesSession(t *testing.T) {
 	m := testModel(t)
 
-	x, y := find(t, m, "Sway ›")
+	x, y := find(t, m, "›")
 	m = click(m, x, y)
 	if got := m.sessions[m.session].name; got != "Shell" {
-		t.Errorf("session after clicking name = %q, want Shell", got)
+		t.Errorf("session after clicking › = %q, want Shell", got)
 	}
 
 	x, y = find(t, m, "‹")
@@ -70,7 +72,7 @@ func TestLayoutMenuPull(t *testing.T) {
 	m := testModel(t)
 
 	bx, by := find(t, m, "us (3l) ▾")
-	if by != 0 || bx < 80 {
+	if by != 1 || bx < 80 {
 		t.Errorf("layout button at (%d, %d), want top right", bx, by)
 	}
 	m = click(m, bx, by)
@@ -78,9 +80,8 @@ func TestLayoutMenuPull(t *testing.T) {
 		t.Fatalf("pressing the layout button: open = %v, focus = %d", m.menuOpen, m.focus)
 	}
 
-	// "│ us  " matches the "us" item, not "us (3l)".
-	x, y := find(t, m, "│ us  ")
-	x += 2
+	// " us  " matches the "us" item, not "us (3l)".
+	x, y := find(t, m, " us  ")
 	next, _ := m.Update(tea.MouseMotionMsg{X: x, Y: y, Button: tea.MouseLeft})
 	m = next.(model)
 	if m.menuHover != 1 {
@@ -208,6 +209,52 @@ func TestClickOutsideBox(t *testing.T) {
 	m = click(m, 0, 0)
 	if m.focus != fieldUser {
 		t.Errorf("focus = %d, want user field", m.focus)
+	}
+}
+
+func TestBoxes(t *testing.T) {
+	m := testModel(t)
+	if got := m.boxes(); got != "" {
+		t.Errorf("boxes without a cell size = %q, want none", got)
+	}
+
+	m.cellW, m.cellH = 8, 16
+	b := m.widget(fieldButton)
+	above := box{b.x * 8, b.y*16 - 8, b.w * 8, 8, colorPurple}.escape()
+	below := box{b.x * 8, (b.y + 1) * 16, b.w * 8, 8, colorPurple}.escape()
+	if got := m.boxes(); !strings.Contains(got, above) || !strings.Contains(got, below) {
+		t.Errorf("boxes = %q, want the button padded by %q and %q", got, above, below)
+	}
+
+	m.setFocus(fieldButton)
+	pink := box{b.x * 8, b.y*16 - 8, b.w * 8, 8, colorPink}.escape()
+	if got := m.boxes(); !strings.Contains(got, pink) {
+		t.Errorf("boxes with the button focused = %q, want %q", got, pink)
+	}
+
+	m.result = &loginResult{}
+	if got := m.boxes(); got != "" {
+		t.Errorf("boxes after logging in = %q, want none", got)
+	}
+}
+
+func TestBoxOutputWrite(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	out := newBoxOutput(w)
+	out.setBoxes("B")
+
+	n, err := out.Write([]byte("text"))
+	if n != 4 || err != nil {
+		t.Errorf("Write = %d, %v, want 4, nil", n, err)
+	}
+	_ = out.Close()
+	got, _ := io.ReadAll(r)
+	if string(got) != "textB" {
+		t.Errorf("wrote %q, want the boxes after the text", got)
 	}
 }
 

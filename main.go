@@ -64,8 +64,9 @@ func run(args cli) error {
 		return fmt.Errorf("no keyboard layouts")
 	}
 
-	m := newModel(args.PAMService, hostname, loadSessions(args.SessionsDir), layouts)
-	final, err := tea.NewProgram(m).Run()
+	out := newBoxOutput(os.Stdout)
+	m := newModel(args.PAMService, hostname, loadSessions(args.SessionsDir), layouts, out)
+	final, err := tea.NewProgram(m, tea.WithOutput(out)).Run()
 	if err != nil {
 		return fmt.Errorf("running form: %w", err)
 	}

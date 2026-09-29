@@ -1,28 +1,32 @@
 package main
 
 import (
-	"fmt"
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/msteinert/pam/v2"
 )
 
-// Form layout, in cells inside the box's border and padding.
+// Form layout, in cells. The form is a card of solid rectangles. Each field
+// and the button is a row of text padded by half a row above and below,
+// which is drawn with boxes.
 const (
-	formWidth  = 40
+	formWidth  = 46
 	labelWidth = 10
+	cardPadX   = 4
+	cardWidth  = formWidth + 2*cardPadX
+	cardHeight = 20
 
-	rowUser    = 2
-	rowPass    = 4
-	rowSession = 6
-	rowButton  = 8
-
-	boxBorder  = 1
-	boxPadVert = 1
-	boxPadHorz = 3
+	// Rows in the card.
+	rowTitle   = 2
+	rowUser    = 5
+	rowPass    = 8
+	rowSession = 11
+	rowButton  = 14
+	rowStatus  = 17
 )
 
 type field int
@@ -37,28 +41,29 @@ const (
 	numFields
 )
 
-// Colors are ANSI indices, so they follow frecon's --palette.
-var (
-	colorBorder = lipgloss.Color("4")
-	colorAccent = lipgloss.Color("1")
-	colorTitle  = lipgloss.Color("3")
-	colorError  = lipgloss.Color("9")
-	colorDim    = lipgloss.Color("6")
+var fieldRows = [...]int{
+	fieldUser:    rowUser,
+	fieldPass:    rowPass,
+	fieldSession: rowSession,
+	fieldButton:  rowButton,
+}
 
-	boxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(colorBorder).
-			Padding(boxPadVert, boxPadHorz)
-	titleStyle             = lipgloss.NewStyle().Bold(true).Foreground(colorTitle)
-	labelStyle             = lipgloss.NewStyle().Width(labelWidth)
-	focusedLabelStyle      = labelStyle.Bold(true).Foreground(colorAccent)
-	buttonStyle            = lipgloss.NewStyle().Padding(0, 2).Border(lipgloss.RoundedBorder(), false, true).BorderForeground(colorBorder)
-	focusedButtonStyle     = buttonStyle.Bold(true).Reverse(true).Foreground(colorAccent).BorderForeground(colorAccent)
-	menuButtonStyle        = lipgloss.NewStyle().Padding(0, 1).Foreground(colorDim)
-	focusedMenuButtonStyle = menuButtonStyle.Bold(true).Reverse(true).Foreground(colorAccent)
-	menuStyle              = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(colorBorder)
-	errorStyle             = lipgloss.NewStyle().Foreground(colorError)
-	dimStyle               = lipgloss.NewStyle().Foreground(colorDim)
+var (
+	onCard       = lipgloss.NewStyle().Background(colorBlack.text)
+	titleStyle   = onCard.Bold(true).Foreground(colorYellow.text)
+	labelStyle   = onCard.Width(labelWidth).Foreground(colorGrey.text)
+	focusedLabel = labelStyle.Bold(true).Foreground(colorPink.text)
+	statusStyle  = onCard.Width(formWidth).Align(lipgloss.Center).Foreground(colorGrey.text)
+	errorStyle   = statusStyle.Foreground(colorRose.text)
+	arrowStyle   = lipgloss.NewStyle().Foreground(colorGrey.text)
+	focusedArrow = arrowStyle.Bold(true).Foreground(colorPink.text)
+
+	buttonStyle        = lipgloss.NewStyle().Bold(true).Foreground(colorCream.text).Background(colorPurple.text)
+	focusedButtonStyle = buttonStyle.Foreground(colorBlack.text).Background(colorPink.text)
+	menuButtonStyle    = onCard.Foreground(colorGrey.text)
+	focusedMenuButton  = menuButtonStyle.Bold(true).Foreground(colorPink.text)
+	menuItemStyle      = onCard
+	hoveredMenuItem    = menuItemStyle.Bold(true).Foreground(colorBlack.text).Background(colorPink.text)
 )
 
 const buttonText = "Log in"
@@ -73,6 +78,15 @@ type loginResult struct {
 type authMsg struct {
 	tx  *pam.Transaction
 	err error
+}
+
+// cellRect is a rectangle of cells on the screen.
+type cellRect struct {
+	x, y, w, h int
+}
+
+func (r cellRect) contains(x, y int) bool {
+	return x >= r.x && x < r.x+r.w && y >= r.y && y < r.y+r.h
 }
 
 type model struct {
@@ -95,17 +109,27 @@ type model struct {
 	menuHover  int
 	menuPulled bool
 
+	// out draws the boxes, and cellW and cellH are the size of a cell in
+	// pixels, or zeros if it is not known and there are no boxes.
+	out          *boxOutput
+	cellW, cellH int
+
 	width, height int
 	busy          bool
 	status        string
+	statusErr     bool
 	result        *loginResult
 }
 
-func newModel(pamService, hostname string, sessions []sessionEntry, layouts []keyLayout) model {
+func newModel(pamService, hostname string, sessions []sessionEntry, layouts []keyLayout, out *boxOutput) model {
 	newInput := func() textinput.Model {
 		ti := textinput.New()
 		ti.Prompt = ""
-		ti.SetWidth(formWidth - labelWidth - 1)
+		// Leave a cell of padding on each side, and one for the cursor.
+		ti.SetWidth(formWidth - labelWidth - 3)
+		styles := ti.Styles()
+		styles.Blurred.Text = styles.Focused.Text
+		ti.SetStyles(styles)
 		return ti
 	}
 
@@ -116,6 +140,7 @@ func newModel(pamService, hostname string, sessions []sessionEntry, layouts []ke
 		layouts:    layouts,
 		user:       newInput(),
 		pass:       newInput(),
+		out:        out,
 	}
 	m.pass.EchoMode = textinput.EchoPassword
 	m.pass.EchoCharacter = '●'
@@ -132,12 +157,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.out != nil {
+			m.cellW, m.cellH = m.out.cellSize()
+		}
 		return m, nil
 
 	case authMsg:
 		m.busy = false
 		if msg.err != nil {
-			m.status = errorStyle.Render(msg.err.Error())
+			m.setStatus(msg.err.Error(), true)
 			m.pass.Reset()
 			return m, m.setFocus(fieldPass)
 		}
@@ -174,7 +202,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.MouseWheelMsg:
-		if _, row, ok := m.formPos(msg.X, msg.Y); ok && row == rowSession {
+		if f, ok := m.fieldAt(msg.X, msg.Y); ok && f == fieldSession {
 			switch msg.Button {
 			case tea.MouseWheelUp:
 				m.cycleSession(-1)
@@ -253,7 +281,7 @@ func (m model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 		m.menuOpen = false
 		return m, nil
 	}
-	if bx, by, bw := m.menuButtonPos(); y == by && x >= bx && x < bx+bw {
+	if padded(m.menuButton()).contains(x, y) {
 		// Pressing the button pulls the dropdown down until the release.
 		cmd := m.setFocus(fieldLayout)
 		m.openMenu()
@@ -261,33 +289,25 @@ func (m model) handleClick(x, y int) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	col, row, ok := m.formPos(x, y)
+	f, ok := m.fieldAt(x, y)
 	if !ok {
 		return m, nil
 	}
-	switch row {
-	case rowUser:
-		return m, m.setFocus(fieldUser)
-	case rowPass:
-		return m, m.setFocus(fieldPass)
-	case rowSession:
-		cmd := m.setFocus(fieldSession)
-		// The "‹ " before the name goes back, anything else forward.
-		if col >= labelWidth && col < labelWidth+2 {
+	cmd := m.setFocus(f)
+	switch f {
+	case fieldSession:
+		// The left half, with the ‹, goes back, and the right half forward.
+		w := m.widget(fieldSession)
+		if x < w.x+w.w/2 {
 			m.cycleSession(-1)
 		} else {
 			m.cycleSession(1)
 		}
-		return m, cmd
-	case rowButton:
-		start, end := m.buttonSpan()
-		if col >= start && col < end {
-			cmd := m.setFocus(fieldButton)
-			next, submitCmd := m.submit()
-			return next, tea.Batch(cmd, submitCmd)
-		}
+	case fieldButton:
+		next, submitCmd := m.submit()
+		return next, tea.Batch(cmd, submitCmd)
 	}
-	return m, nil
+	return m, cmd
 }
 
 func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -336,14 +356,18 @@ func (m model) setKeymap() tea.Cmd {
 	return tea.Raw(m.layouts[m.layout].escape())
 }
 
+func (m *model) setStatus(s string, isErr bool) {
+	m.status, m.statusErr = s, isErr
+}
+
 func (m model) submit() (tea.Model, tea.Cmd) {
 	user := strings.TrimSpace(m.user.Value())
 	if user == "" {
-		m.status = errorStyle.Render("Enter a user name")
+		m.setStatus("Enter a user name", true)
 		return m, m.setFocus(fieldUser)
 	}
 	m.busy = true
-	m.status = dimStyle.Render("Authenticating…")
+	m.setStatus("Authenticating…", false)
 	service, password := m.pamService, m.pass.Value()
 	return m, func() tea.Msg {
 		tx, err := authenticate(service, user, password)
@@ -351,145 +375,188 @@ func (m model) submit() (tea.Model, tea.Cmd) {
 	}
 }
 
-// boxOrigin returns the screen position of the box's top left corner.
-func (m model) boxOrigin(boxW, boxH int) (int, int) {
-	return max(0, (m.width-boxW)/2), max(0, (m.height-boxH)/2)
+// card returns the card's position on the screen.
+func (m model) card() cellRect {
+	return cellRect{max(0, (m.width-cardWidth)/2), max(0, (m.height-cardHeight)/2), cardWidth, cardHeight}
 }
 
-// formPos converts a screen position to a column and row in the form.
-func (m model) formPos(x, y int) (col, row int, ok bool) {
-	box := m.renderBox()
-	bx, by := m.boxOrigin(lipgloss.Width(box), lipgloss.Height(box))
-	col = x - bx - boxBorder - boxPadHorz
-	row = y - by - boxBorder - boxPadVert
-	ok = col >= 0 && col < formWidth && row >= 0
-	return col, row, ok
+// widget returns the text row of a field or the button, which has a cell
+// of padding on each side.
+func (m model) widget(f field) cellRect {
+	c := m.card()
+	return cellRect{c.x + cardPadX + labelWidth, c.y + fieldRows[f], formWidth - labelWidth, 1}
 }
 
-// buttonSpan returns the form columns covered by the button.
-func (m model) buttonSpan() (int, int) {
-	w := lipgloss.Width(buttonStyle.Render(buttonText))
-	start := (formWidth - w) / 2
-	return start, start + w
+// padded returns a widget's text row with the half rows that pad it, as the
+// rows they are in.
+func padded(r cellRect) cellRect {
+	return cellRect{r.x, r.y - 1, r.w, r.h + 2}
 }
 
-func (m model) renderBox() string {
-	center := lipgloss.NewStyle().Width(formWidth).Align(lipgloss.Center)
-	left := lipgloss.NewStyle().Width(formWidth)
-
-	label := func(f field, text string) string {
-		if m.focus == f && !m.busy {
-			return focusedLabelStyle.Render(text)
+// fieldAt returns the field or button under a screen position. A field's row
+// includes its label.
+func (m model) fieldAt(x, y int) (field, bool) {
+	for f := fieldUser; f <= fieldButton; f++ {
+		r := padded(m.widget(f))
+		if f != fieldButton {
+			r.x -= labelWidth
+			r.w += labelWidth
 		}
-		return labelStyle.Render(text)
+		if r.contains(x, y) {
+			return f, true
+		}
 	}
-
-	sessName := m.sessions[m.session].name
-	if m.focus == fieldSession {
-		sessName = lipgloss.NewStyle().Bold(true).Render(sessName)
-	}
-	arrows := dimStyle
-	if m.focus == fieldSession {
-		arrows = lipgloss.NewStyle().Foreground(colorAccent)
-	}
-
-	button := buttonStyle
-	if m.focus == fieldButton {
-		button = focusedButtonStyle
-	}
-	start, _ := m.buttonSpan()
-
-	rows := []string{
-		center.Render(titleStyle.Render(m.hostname)),
-		"",
-		left.Render(label(fieldUser, "User") + m.user.View()),
-		"",
-		left.Render(label(fieldPass, "Password") + m.pass.View()),
-		"",
-		left.Render(fmt.Sprintf("%s%s%s%s",
-			label(fieldSession, "Session"), arrows.Render("‹ "), sessName, arrows.Render(" ›"))),
-		"",
-		left.Render(strings.Repeat(" ", start) + button.Render(buttonText)),
-		"",
-		center.Render(m.status),
-	}
-	return boxStyle.Render(strings.Join(rows, "\n"))
+	return 0, false
 }
 
-// menuButtonText is the layout dropdown's button, which shows the layout.
-func (m model) menuButtonText() string {
-	return m.layouts[m.layout].name() + " ▾"
-}
-
-// menuButtonPos returns the screen position and width of the layout
-// dropdown's button, at the top right of the screen.
-func (m model) menuButtonPos() (x, y, w int) {
-	w = lipgloss.Width(menuButtonStyle.Render(m.menuButtonText()))
-	return max(0, m.width-w-1), 0, w
-}
-
-func (m model) renderMenuButton() string {
-	style := menuButtonStyle
-	if m.focus == fieldLayout && !m.busy {
-		style = focusedMenuButtonStyle
-	}
-	return style.Render(m.menuButtonText())
-}
-
-// menuWidth is the width of the items in the open dropdown.
-func (m model) menuWidth() int {
+// menuButton returns the text row of the layout dropdown's button, at the
+// top right of the screen. It is as wide as the longest layout name, so it
+// does not move when the layout changes.
+func (m model) menuButton() cellRect {
 	w := 0
 	for _, l := range m.layouts {
-		w = max(w, lipgloss.Width(l.name()))
+		w = max(w, ansi.StringWidth(l.name()))
 	}
-	return w + 2
+	w += 4
+	return cellRect{max(0, m.width-w-2), 1, w, 1}
 }
 
-// menuPos returns the screen position of the open dropdown, under the
-// button and aligned to its right edge.
-func (m model) menuPos() (int, int) {
-	bx, by, bw := m.menuButtonPos()
-	return max(0, bx+bw-m.menuWidth()-2*boxBorder), by + 1
+// menu returns the open dropdown, right under the button, with a row of
+// padding above and below the layouts. The half row of the button's padding
+// covers the top half of the row above.
+func (m model) menu() cellRect {
+	b := m.menuButton()
+	return cellRect{b.x, b.y + 1, b.w, len(m.layouts) + 2}
 }
 
 // menuItemAt returns the layout under a screen position in the open
 // dropdown.
 func (m model) menuItemAt(x, y int) (int, bool) {
-	mx, my := m.menuPos()
-	col, i := x-mx-boxBorder, y-my-boxBorder
-	ok := col >= 0 && col < m.menuWidth() && i >= 0 && i < len(m.layouts)
-	return i, ok
+	r := m.menu()
+	i := y - r.y - 1
+	return i, r.contains(x, y) && i >= 0 && i < len(m.layouts)
+}
+
+func (m model) renderMenuButton() string {
+	style := menuButtonStyle
+	if m.focus == fieldLayout && !m.busy {
+		style = focusedMenuButton
+	}
+	w := m.menuButton().w
+	name := m.layouts[m.layout].name()
+	return style.Render(" " + name + strings.Repeat(" ", w-3-ansi.StringWidth(name)) + "▾ ")
 }
 
 func (m model) renderMenu() string {
-	item := lipgloss.NewStyle().Width(m.menuWidth()).Padding(0, 1)
-	items := make([]string, len(m.layouts))
+	r := m.menu()
+	pad := menuItemStyle.Render(" ")
+	rows := []string{menuItemStyle.Render(strings.Repeat(" ", r.w))}
 	for i, l := range m.layouts {
-		style := item
+		style := menuItemStyle
 		if i == m.menuHover {
-			style = item.Bold(true).Reverse(true).Foreground(colorAccent)
+			style = hoveredMenuItem
 		}
-		items[i] = style.Render(l.name())
+		rows = append(rows, pad+style.Width(r.w-2).Render(" "+l.name())+pad)
 	}
-	return menuStyle.Render(strings.Join(items, "\n"))
+	rows = append(rows, rows[0])
+	return strings.Join(rows, "\n")
+}
+
+// renderInput renders a text field's row, the text between a cell of
+// padding on each side.
+func renderInput(r cellRect, ti textinput.Model) string {
+	return " " + lipgloss.NewStyle().Width(r.w-2).Render(ti.View()) + " "
+}
+
+func (m model) renderSession(r cellRect) string {
+	focused := m.focus == fieldSession && !m.busy
+	arrows := arrowStyle
+	if focused {
+		arrows = focusedArrow
+	}
+	name := lipgloss.NewStyle().Bold(focused).
+		Width(r.w - 4).Align(lipgloss.Center).
+		Render(ansi.Truncate(m.sessions[m.session].name, r.w-4, "…"))
+	return " " + arrows.Render("‹") + name + arrows.Render("›") + " "
+}
+
+func (m model) buttonFocused() bool {
+	return m.focus == fieldButton && !m.busy
+}
+
+func (m model) renderButton(r cellRect) string {
+	style := buttonStyle
+	if m.buttonFocused() {
+		style = focusedButtonStyle
+	}
+	return style.Width(r.w).Align(lipgloss.Center).Render(buttonText)
+}
+
+// boxes returns the escapes that draw the form's boxes, or nothing if the
+// cell size is not known or the form is done.
+func (m model) boxes() string {
+	if m.cellW == 0 || m.cellH == 0 || m.result != nil {
+		return ""
+	}
+	var boxes []box
+	for _, f := range []field{fieldUser, fieldPass, fieldSession} {
+		boxes = append(boxes, padBoxes(m.widget(f), colorBackground, m.cellW, m.cellH)...)
+	}
+	button := colorPurple
+	if m.buttonFocused() {
+		button = colorPink
+	}
+	boxes = append(boxes, padBoxes(m.widget(fieldButton), button, m.cellW, m.cellH)...)
+	boxes = append(boxes, padBoxes(m.menuButton(), colorBlack, m.cellW, m.cellH)...)
+	return boxEscapes(boxes)
 }
 
 func (m model) View() tea.View {
-	box := m.renderBox()
-	boxW, boxH := lipgloss.Width(box), lipgloss.Height(box)
-	bx, by := m.boxOrigin(boxW, boxH)
-	mbx, mby, _ := m.menuButtonPos()
+	c := m.card()
+	formX := c.x + cardPadX
+
+	label := func(f field, text string) *lipgloss.Layer {
+		style := labelStyle
+		if m.focus == f && !m.busy {
+			style = focusedLabel
+		}
+		return lipgloss.NewLayer(style.Render(text)).X(formX).Y(c.y + fieldRows[f])
+	}
+	at := func(r cellRect, s string) *lipgloss.Layer {
+		return lipgloss.NewLayer(s).X(r.x).Y(r.y)
+	}
+
+	status := statusStyle
+	if m.statusErr {
+		status = errorStyle
+	}
+	user, pass := m.widget(fieldUser), m.widget(fieldPass)
+	session, button := m.widget(fieldSession), m.widget(fieldButton)
 
 	layers := []*lipgloss.Layer{
-		lipgloss.NewLayer(box).X(bx).Y(by),
-		lipgloss.NewLayer(m.renderMenuButton()).X(mbx).Y(mby),
+		at(c, onCard.Width(c.w).Height(c.h).Render("")),
+		lipgloss.NewLayer(titleStyle.Width(formWidth).Align(lipgloss.Center).
+			Render(ansi.Truncate(m.hostname, formWidth, "…"))).X(formX).Y(c.y + rowTitle),
+		label(fieldUser, "User"),
+		at(user, renderInput(user, m.user)),
+		label(fieldPass, "Password"),
+		at(pass, renderInput(pass, m.pass)),
+		label(fieldSession, "Session"),
+		at(session, m.renderSession(session)),
+		at(button, m.renderButton(button)),
+		lipgloss.NewLayer(status.Render(ansi.Truncate(m.status, formWidth, "…"))).X(formX).Y(c.y + rowStatus),
+		at(m.menuButton(), m.renderMenuButton()),
 	}
 	if m.menuOpen {
-		mx, my := m.menuPos()
-		layers = append(layers, lipgloss.NewLayer(m.renderMenu()).X(mx).Y(my).Z(1))
+		layers = append(layers, at(m.menu(), m.renderMenu()).Z(1))
 	}
-	canvas := lipgloss.NewCanvas(max(m.width, boxW), max(m.height, boxH))
+	canvas := lipgloss.NewCanvas(max(m.width, c.w), max(m.height, c.h))
 	canvas.Compose(lipgloss.NewCompositor(layers...))
+
+	// The boxes go with the text they pad, and are drawn after it is.
+	if m.out != nil {
+		m.out.setBoxes(m.boxes())
+	}
 
 	v := tea.NewView(canvas.Render())
 	v.AltScreen = true
